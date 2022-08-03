@@ -1,4 +1,3 @@
-import { BuilderElement } from "@builder.io/sdk";
 import {
   Button,
   createMuiTheme,
@@ -11,21 +10,15 @@ import {
   TextField,
   Tooltip,
   Typography,
-  Select,
-  MenuItem,
-  withStyles,
   Tabs,
   Tab,
   Box,
 } from "@material-ui/core";
 import green from "@material-ui/core/colors/green";
 import { HelpOutline } from "@material-ui/icons";
-import SvgIcon from "@material-ui/core/SvgIcon";
 import Favorite from "@material-ui/icons/Favorite";
-import * as fileType from "file-type";
 import { action, computed, observable, when } from "mobx";
 import { observer } from "mobx-react";
-import * as pako from "pako";
 import * as React from "react";
 import * as ReactDOM from "react-dom";
 import * as md5 from "spark-md5";
@@ -35,7 +28,6 @@ import { SafeComponent } from "./classes/safe-component";
 import { settings } from "./constants/settings";
 import { theme as themeVars } from "./constants/theme";
 import { fastClone } from "./functions/fast-clone";
-import { transformWebpToPNG } from "./functions/encode-images";
 import { traverseLayers } from "./functions/traverse-layers";
 import "./ui.css";
 import { IntlProvider, FormattedMessage } from "react-intl";
@@ -45,53 +37,15 @@ import { CheckListContent } from "./constants/utils";
 import { MobileIcon } from "./components/Icons/MobileIcon";
 import { TabletIcon } from "./components/Icons/TabletIcon";
 import { DesktopIcon } from "./components/Icons/DesktopIcon";
-
-// Simple debug flag - flip when needed locally
-const useDev = false;
-
-// https://stackoverflow.com/a/46634877
-type Writeable<T> = { -readonly [P in keyof T]: T[P] };
-
-const apiHost = useDev ? "http://localhost:4000" : "https://builder.io";
-
-const selectionToBuilder = async (
-  selection: SceneNode[]
-): Promise<BuilderElement[]> => {
-  const useGzip = true;
-
-  selection = fastClone(selection);
-
-  traverse(selection).forEach(function (item) {
-    if (this.key === "intArr") {
-      this.delete();
-    }
-  });
-
-  const res = await fetch(`${apiHost}/api/v1/figma-to-builder`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(
-      useGzip
-        ? {
-            compressedNodes: pako.deflate(JSON.stringify(selection), {
-              to: "string",
-            }),
-          }
-        : {
-            nodes: selection,
-          }
-    ),
-  }).then((res) => {
-    if (!res.ok) {
-      console.error("Figma-to-builder request failed", res);
-      throw new Error("Figma-to-builder request failed");
-    }
-    return res.json();
-  });
-  return res.blocks;
-};
+import { apiKey, clamp, selectionToBuilder } from "./ui-helpers";
+import { apiHost, useDev } from "./ui-helpers/dev";
+import { getImageFills, Node, processImages } from "./ui-helpers/image";
+import {
+  lsGet,
+  WIDTH_LS_KEY,
+  FRAMES_LS_KEY,
+  lsSet,
+} from "./ui-helpers/localStorage";
 
 interface ClientStorage {
   imageUrlsByHash: { [hash: string]: string | null } | undefined;
@@ -103,32 +57,6 @@ interface TabPanelProps {
   value: number;
 }
 
-const apiKey = process.env.API_KEY || null;
-
-const WIDTH_LS_KEY = "builder.widthSetting";
-const FRAMES_LS_KEY = "builder.useFramesSetting";
-
-// TODO: make async and use figma.clientStorage
-function lsGet(key: string) {
-  try {
-    return JSON.parse(localStorage.getItem(key)!);
-  } catch (err) {
-    return undefined;
-  }
-}
-function lsSet(key: string, value: any) {
-  try {
-    return localStorage.setItem(key, JSON.stringify(value));
-  } catch (err) {
-    return undefined;
-  }
-}
-
-const clamp = (num: number, min: number, max: number) =>
-  Math.max(min, Math.min(max, num));
-
-type Node = TextNode | RectangleNode;
-
 const theme = createMuiTheme({
   typography: themeVars.typography,
   palette: {
@@ -136,126 +64,6 @@ const theme = createMuiTheme({
     secondary: green,
   },
 });
-
-const StyledButton = withStyles({
-  root: {
-    fontSize: "12px",
-    padding: "8px",
-    height: "30px",
-    minHeight: "unset",
-    display: "flex",
-    justifyContent: "center",
-  },
-})(MenuItem);
-
-const BASE64_MARKER = ";base64,";
-function convertDataURIToBinary(dataURI: string) {
-  const base64Index = dataURI.indexOf(BASE64_MARKER) + BASE64_MARKER.length;
-  const base64 = dataURI.substring(base64Index);
-  const raw = window.atob(base64);
-  const rawLength = raw.length;
-  const array = new Uint8Array(new ArrayBuffer(rawLength));
-
-  for (let i = 0; i < rawLength; i++) {
-    array[i] = raw.charCodeAt(i);
-  }
-  return array;
-}
-
-function getImageFills(layer: Node) {
-  const images =
-    Array.isArray(layer.fills) &&
-    layer.fills
-      .filter((item) => item.type === "IMAGE" && item.visible && item.opacity)
-      .sort((a, b) => b.opacity - a.opacity);
-  return images;
-}
-
-// TODO: CACHE!
-// const imageCache: { [key: string]: Uint8Array | undefined } = {};
-async function processImages(layer: Node) {
-  const images = getImageFills(layer);
-
-  const convertToSvg = (value: string) => {
-    (layer as any).type = "SVG";
-    (layer as any).svg = value;
-    if (typeof layer.fills !== "symbol") {
-      layer.fills = layer.fills.filter((item) => item.type !== "IMAGE");
-    }
-  };
-  if (!images) {
-    return Promise.resolve([]);
-  }
-
-  type AugmentedImagePaint = Writeable<ImagePaint> & {
-    intArr?: Uint8Array;
-    url?: string;
-  };
-
-  return Promise.all(
-    images.map(async (image: AugmentedImagePaint) => {
-      try {
-        if (!image || !image.url) {
-          return;
-        }
-
-        const url = image.url;
-        if (url.startsWith("data:")) {
-          const type = url.split(/[:,;]/)[1];
-          if (type.includes("svg")) {
-            const svgValue = decodeURIComponent(url.split(",")[1]);
-            convertToSvg(svgValue);
-            return Promise.resolve();
-          } else {
-            if (url.includes(BASE64_MARKER)) {
-              image.intArr = convertDataURIToBinary(url);
-              delete image.url;
-            } else {
-              console.info("Found data url that could not be converted", url);
-            }
-            return;
-          }
-        }
-
-        const isSvg = url.endsWith(".svg");
-
-        // Proxy returned content through Builder so we can access cross origin for
-        // pulling in photos, etc
-        const res = await fetch(
-          `${apiHost}/api/v1/proxy-api?url=${encodeURIComponent(url)}`
-        );
-
-        const contentType = res.headers.get("content-type");
-        if (isSvg || contentType?.includes("svg")) {
-          const text = await res.text();
-          convertToSvg(text);
-        } else {
-          const arrayBuffer = await res.arrayBuffer();
-          const type = fileType(arrayBuffer);
-          if (type && (type.ext.includes("svg") || type.mime.includes("svg"))) {
-            convertToSvg(await res.text());
-            return;
-          } else {
-            const intArr = new Uint8Array(arrayBuffer);
-            delete image.url;
-
-            if (
-              type &&
-              (type.ext.includes("webp") || type.mime.includes("image/webp"))
-            ) {
-              const pngArr = await transformWebpToPNG(intArr);
-              image.intArr = pngArr;
-            } else {
-              image.intArr = intArr;
-            }
-          }
-        }
-      } catch (err) {
-        console.warn("Could not fetch image", layer, err);
-      }
-    })
-  );
-}
 
 function TabPanel(props: TabPanelProps) {
   const { children, value, index } = props;
